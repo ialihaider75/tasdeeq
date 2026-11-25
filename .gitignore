@@ -37,3 +37,6 @@ build/
 
 ### secrets ###
 .env
+
+### Node ###
+node_modules/

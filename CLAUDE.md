@@ -45,7 +45,6 @@ workflow builds and publishes them.
   sources + Javadoc jars), jars + SHA-256 checksums attached to the GitHub Release, server image to
   GHCR, APK to the GitHub Release, widget to npm.
 - Client libraries keep backward compatibility within a major version.
-
 ## Tech stack (do not substitute without an ADR)
 
 - Server: Java 21, Spring Boot 3.x, Spring Modulith, Spring Security, Web MVC, Spring Data JPA (Hibernate),
@@ -57,11 +56,12 @@ workflow builds and publishes them.
 - Optional events: spring-kafka, auto-configured only when `tasdeeq.events.kafka.*` is set.
 - Admin page: Thymeleaf inside `tasdeeq-server`. Web widget: plain TypeScript, no framework, < 15 KB gz.
 - Android: Kotlin, minSdk 26, Hilt, WorkManager, Room, DataStore, EncryptedSharedPreferences, OkHttp.
-
 ## Commands
 
 ```bash
-./mvnw verify                        # all server + sim tests (Testcontainers needs Docker)
+./mvnw test                          # unit tests only (*Test), no Docker needed
+./mvnw verify                        # unit + integration tests (*IT, Testcontainers needs Docker)
+./mvnw -pl tasdeeq-server verify -Dit.test=VerificationApiIT   # a single IT
 ./mvnw -pl tasdeeq-server spring-boot:run -Dspring-boot.run.profiles=local
 docker compose up -d                 # full local stack
 ./mvnw -pl tasdeeq-sim exec:java -Dexec.args="pair --token <t>"   # simulated gateway
@@ -95,7 +95,6 @@ Keep this section accurate: update it when you add or change a command.
 - `tasdeeq-web-widget` holds no API key and polls the integrator's own backend, never Tasdeeq.
 - Nothing operator-specific is hard-coded (brand, numbers, provider, prefix). Everything goes through
   `tasdeeq.*` config (spec §12.1).
-
 ## Coding conventions
 
 - TDD: write the failing test first, then the code. Every FR-x in the spec needs at least one test;
@@ -107,7 +106,125 @@ Keep this section accurate: update it when you add or change a command.
 - Errors: RFC 9457 problem details with the stable `code` values in spec §8.6.
 - Flyway migrations are append-only; never edit a released migration.
 - Update `openapi.yaml` in the same change as any API change; the contract test enforces it.
+## Testing conventions (Java modules)
 
+Every behaviour gets **both** unit tests and, where it touches Spring wiring, the database, Redis or
+HTTP, an integration test.
+
+| Kind | Class name | Runs with | Uses |
+| --- | --- | --- | --- |
+| Unit | `*Test` (e.g. `PhoneNumbersTest`) | Surefire, `./mvnw test` | JUnit 5, Mockito, AssertJ; no Spring context, no containers |
+| Integration | `*IT` (e.g. `VerificationApiIT`) | Failsafe, `./mvnw verify` | **Must extend `IntegrationTestSupport`**; real Postgres + Redis via Testcontainers |
+
+- Configure `maven-surefire-plugin` for `**/*Test.java` and `maven-failsafe-plugin` for `**/*IT.java`
+  (goals `integration-test` + `verify`) in the parent `pom.xml`. `./mvnw verify` must run both.
+- `IntegrationTestSupport` lives in `tasdeeq-server/src/test/java/com/intellermatrix/tasdeeq/server/support/`.
+  Never start containers in individual IT classes; add any new container to the base class.
+- ITs call the API through **RestAssured** (black-box, random port) or **MockMvc** (when inspecting
+  Spring MVC details), and check state through `DbOperations`, not through production repositories.
+- Each IT starts from a clean state: `@BeforeEach` truncates all tables (except Flyway history) and
+  flushes Redis.
+- BDD (Cucumber) scenarios run as ITs on top of the same base class.
+- Client libraries (`tasdeeq-client`, starter) have no server: their ITs use WireMock and do not
+  extend `IntegrationTestSupport`.
+- Use `Clock` injection for time-dependent tests; never `Thread.sleep` (use Awaitility for async).
+  Base class template (follow this structure):
+
+```java
+package com.intellermatrix.tasdeeq.server.support;
+ 
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@AutoConfigureMockMvc
+@ActiveProfiles("test")
+@Import(TestAsyncConfig.class)                 // runs async/event listeners synchronously in tests
+public abstract class IntegrationTestSupport {
+ 
+    // Started once per JVM and shared by every IT class (singleton container pattern).
+    static final PostgreSQLContainer<?> POSTGRES =
+            new PostgreSQLContainer<>("postgres:16-alpine")
+                    .withDatabaseName("tasdeeq").withUsername("tasdeeq").withPassword("tasdeeq");
+ 
+    static final GenericContainer<?> REDIS =
+            new GenericContainer<>("redis:7-alpine").withExposedPorts(6379)
+                    .waitingFor(Wait.forListeningPort());
+ 
+    static {
+        POSTGRES.start();
+        REDIS.start();
+    }
+ 
+    @DynamicPropertySource
+    static void containerProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registry.add("spring.datasource.username", POSTGRES::getUsername);
+        registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("spring.data.redis.host", REDIS::getHost);
+        registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+    }
+ 
+    @Autowired protected MockMvc mockMvc;
+    @Autowired protected DbOperations dbOperations;   // test helper: truncate tables, flush Redis, seed data
+    @LocalServerPort protected int port;
+ 
+    @BeforeEach
+    void resetState() {
+        RestAssured.baseURI = "http://localhost";
+        RestAssured.port = port;
+        dbOperations.clearDatabase();
+        dbOperations.flushRedis();
+    }
+}
+```
+
+`DbOperations` template (same package; a test-only `@Component`, no Lombok):
+
+```java
+@Component
+public class DbOperations {
+ 
+    private final JdbcTemplate jdbc;
+    private final StringRedisTemplate redis;
+ 
+    public DbOperations(JdbcTemplate jdbc, StringRedisTemplate redis) {
+        this.jdbc = jdbc;
+        this.redis = redis;
+    }
+ 
+    /** Empties every application table (incl. event_publication); keeps Flyway history. */
+    public void clearDatabase() {
+        List<String> tables = jdbc.queryForList("""
+                SELECT tablename FROM pg_tables
+                WHERE schemaname = 'public' AND tablename <> 'flyway_schema_history'
+                """, String.class);
+        if (!tables.isEmpty()) {
+            jdbc.execute("TRUNCATE TABLE " + String.join(", ", tables) + " RESTART IDENTITY CASCADE");
+        }
+    }
+ 
+    public void flushRedis() {
+        redis.execute((RedisCallback<Void>) connection -> {
+            connection.serverCommands().flushDb();
+            return null;
+        });
+    }
+ 
+    // Seed and read helpers for ITs go here, written as plain SQL, e.g.
+    // insertClientApp(...), countVerificationEvents(String verificationId).
+}
+```
+
+- Never inject production repositories or entities into `DbOperations`. Use SQL, so test setup
+  doesn't depend on any module's internals.
+- New tables need no change here: they are found from `pg_tables`.
+  Rules for the base class:
+- Pin image versions (`postgres:16-alpine`, `redis:7-alpine`), never `latest`.
+- Use readiness waits (`PostgreSQLContainer`'s built-in wait, `Wait.forListeningPort()`), not
+  `IsRunningStartupCheckStrategy`, which only checks the container is running, not ready.
+- No `@DirtiesContext`: one shared Spring context across all ITs keeps the suite fast. Use it only
+  on a specific IT that truly changes context state, with a comment explaining why.
+- Test credentials are dummy values defined only in the test code; never real passwords.
+- When WhatsApp, Kafka or the fallback provider are tested, add their containers or WireMock stubs
+  here (e.g. a `KafkaContainer`, started lazily only when needed).
 ## Security and privacy — non-negotiable
 
 - The gateway app forwards **only** SMS on the bound SIM whose body matches the configured pattern.
@@ -120,18 +237,63 @@ Keep this section accurate: update it when you add or change a command.
 - Verify Meta's `X-Hub-Signature-256` before parsing WhatsApp webhooks. Sign outbound webhooks
   with HMAC-SHA256 (`Tasdeeq-Signature: t=…,v1=…`).
 - No secrets in the repo. Use `.env` (git-ignored) and provide `.env.example`.
+- `.gitignore` must include `local/`, `.env`, `target/`, `build/`, `node_modules/` and IDE folders.
+## Development workflow (mandatory for every milestone)
 
-## How to work on a milestone
+Milestones are in spec §16 (M0 → M7), done strictly in order. This workflow uses the **Superpowers**
+skills. Every step marked **⏸ STOP** means: stop, report, and wait for the user's explicit instruction.
+Never skip a gate, never combine gates, never assume approval.
 
-Milestones are in spec §16 (M0 → M7). Work on **one milestone per session** unless told otherwise.
+### Where documents live
 
-1. Re-read the milestone and the FRs it covers in `docs/SPEC.md`.
-2. Propose a short plan (files, tests, any decision worth an ADR) before writing code.
-3. Build test-first; keep `./mvnw verify` green after each step.
-4. Finish with: all tests green, Modulith check green, `openapi.yaml` and README updated,
-   and a short summary of what was done and what is left.
-5. If the spec is ambiguous or seems wrong, stop and ask — do not invent behaviour.
+- Design docs: `local/superpowers/specs/<milestone>-design.md` (e.g. `M0-design.md`)
+- Plans: `local/superpowers/plans/<milestone>-plan.md`
+- `local/` is git-ignored: these are working documents, never committed, never pushed.
+  This overrides the Superpowers default location (`docs/superpowers/...`).
+### Phase 1 — Design (once per milestone)
 
+1. Read the milestone and the FRs it covers in `docs/SPEC.md`.
+2. Use the `superpowers:brainstorming` skill to produce the milestone design doc. It must stay within
+   the spec; anything the spec leaves open is listed as a question, not decided silently.
+3. **⏸ STOP — design review.** The user reviews and may request changes. Apply them and stop again,
+   until the user explicitly approves the design.
+### Phase 2 — Plan (once per milestone)
+
+4. Use the `superpowers:writing-plans` skill to split the approved design into **tasks**, each with
+   checkbox **steps**. Each task = one feature branch = one PR, small enough to review in one sitting.
+   Give every task an ID and a kebab-case name, e.g. `M0-T1 maven-parent`.
+5. **⏸ STOP — plan review.** Apply requested changes until the user explicitly approves the plan.
+### Phase 3 — Per task (repeat for each task in plan order)
+
+6. Sync and branch: `git checkout main && git pull`, then
+   `git checkout -b feature/<task-id>-<task-name>` (e.g. `feature/m0-t1-maven-parent`, lowercase).
+7. Implement with the `superpowers:test-driven-development` skill: red → green → refactor for every
+   step. Run `./mvnw verify` (and Gradle/npm where relevant) before reporting.
+8. **⏸ STOP — code review 1.** When the task's steps are green, summarise the changes and the test
+   results. Wait for the user's review and approval.
+9. **Commit only when the user explicitly says "commit".** Conventional message, e.g.
+   `feat(gateway): add device pairing endpoint [M2-T3]`, with the attribution lines required by the session.
+10. **⏸ STOP** after committing. Wait for the user to ask for the independent review.
+11. When asked, use the `superpowers:requesting-code-review` skill to launch an **independent code
+    reviewer subagent** on the branch's diff against `main`. Report its findings in full.
+12. Fix the findings using `superpowers:receiving-code-review` (verify each finding; push back with
+    reasons on any you believe is wrong instead of blindly applying it). Keep tests green.
+13. **⏸ STOP — code review 2.** Wait for the user's review. Commit only on an explicit "commit".
+14. **Push only when the user explicitly says "push"**: `git push -u origin <branch>`.
+    Never open, merge or close PRs; the user does that on GitHub.
+15. **⏸ STOP** until the user says the PR is merged.
+16. Then: `git checkout main && git pull`, delete the local feature branch, and update
+    `local/superpowers/plans/<milestone>-plan.md`, ticking the task and all of its steps as complete.
+17. Move to the next task (back to step 6). After the last task, report that the milestone is
+    complete and **⏸ STOP** before starting the next milestone's Phase 1.
+### Always
+
+- Never `git commit`, `git push`, merge, rebase onto main, force-push or delete remote branches
+  without an explicit instruction for that exact action.
+- One task per branch; never mix work from two tasks in one branch.
+- Each task's changes also update, where relevant: `openapi.yaml`, README, `docs/runbook.md`,
+  `docs/integration-guide.md`, and an ADR in `docs/adr/` for any significant decision.
+- If the spec is ambiguous or seems wrong, stop and ask. Do not invent behaviour.
 ## Out of scope (do not build)
 
 Bulk/marketing SMS, SMPP carrier connections, sending SMS from the gateway SIM, full KYC (CNIC/NADRA),
